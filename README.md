@@ -16,6 +16,8 @@
 
 # mysql-jdv-definer-sqli
 
+**Class:** SQLi
+
 **MySQL Community Server** `mysqld` `26.7.0` (`06a5c1c`) - Oracle
 
 JSON Duality DML concatenates JSON string values with `escape_string_for_mysql` (backslash only), then `parse_sql` under the invoker `sql_mode` after swapping to the view DEFINER sctx. `SET SESSION sql_mode='NO_BACKSLASH_ESCAPES'` makes `\'` end the SQL literal. A JSON string containing `'` injects a subquery / SET-list as DEFINER. Lab: invoker with only DML on the view reads `secret.s` into the projected `name` column.
@@ -25,6 +27,7 @@ Default CREATE VIEW is DEFINER. X Plugin already branches on that mode. JDV does
 | | |
 |---|---|
 | ID | no CVE yet |
+| Class | **SQLi** (DEFINER; not RCE) |
 | CWE | [CWE-89](https://cwe.mitre.org/data/definitions/89.html) |
 | CVSS | **High: 8.1** `CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N` |
 | Product | [MySQL Community Server](https://github.com/mysql/mysql-server) `mysqld` |
