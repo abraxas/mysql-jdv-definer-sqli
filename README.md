@@ -78,5 +78,5 @@ Escape JDV DML strings with the same `NO_BACKSLASH_ESCAPES` branch X Plugin alre
 ## References
 
 - [github.com/mysql/mysql-server](https://github.com/mysql/mysql-server) tag [mysql-26.7.0](https://github.com/mysql/mysql-server/tree/mysql-26.7.0) (`06a5c1c99c377fc41b2eba1ea244e8b220bdc3c8`)
-- [`sql/json_duality_view/dml.cc`](https://github.com/mysql/mysql-server/blob/mysql-26.7.0/sql/json_duality_view/dml.cc) `append_json_dom` / `create_sctx_guard`
+- [sql/json_duality_view/dml.cc](https://github.com/mysql/mysql-server/blob/mysql-26.7.0/sql/json_duality_view/dml.cc) `append_json_dom` / `create_sctx_guard`
 - Sibling packs: [abraxas/mysql-mysqldump-show-tables-overflow](https://github.com/abraxas/mysql-mysqldump-show-tables-overflow) · [abraxas/mysql-mysqldump-tab-path](https://github.com/abraxas/mysql-mysqldump-tab-path) · [abraxas/mysql-mysqlbinlog-raw-path](https://github.com/abraxas/mysql-mysqlbinlog-raw-path) · [abraxas/mysql-set-role-leftover](https://github.com/abraxas/mysql-set-role-leftover)

