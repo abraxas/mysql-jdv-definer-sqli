@@ -13,6 +13,10 @@
   &nbsp;·&nbsp;
   <a href="https://github.com/abraxas/mysql-jdv-definer-sqli">mysql-jdv-definer-sqli</a>
 </p>
+<p align="center">
+  Write-up: <a href="https://abraxaslabs.tech/research/mysql-jdv-definer-sqli"><strong>https://abraxaslabs.tech/research/mysql-jdv-definer-sqli</strong></a>
+</p>
+
 
 # mysql-jdv-definer-sqli
 
